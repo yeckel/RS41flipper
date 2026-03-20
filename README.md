@@ -1,7 +1,7 @@
 # RS41 Tracker — Flipper Zero external app
 
 Receives and decodes **Vaisala RS41** radiosondes using the Flipper Zero's
-built-in CC1101 sub-GHz radio.  No external hardware required.
+built-in CC1101 sub-GHz radio — or an **external CC1101 module** on the GPIO header.
 
 Developed by OK1CHP, inspired by [twatch-rs41](https://github.com/yeckel/twatch-rs41).
 
@@ -10,38 +10,94 @@ Developed by OK1CHP, inspired by [twatch-rs41](https://github.com/yeckel/twatch-
 ## Features
 
 - Live decoding of RS41-SG / RS41-SGP radiosonde frames at 1 Hz
+- **Reed-Solomon error correction** — RS(255,231) t=12, both interleaved codewords
 - Sonde serial number (e.g. `N1320638`)
 - GPS position: latitude, longitude, altitude, satellite count
 - Temperature with full sensor calibration (calframes 3–6)
 - **Barometric pressure** with full sensor calibration (calframes 6–7) — RS41-SGP only
 - RSSI display
+- **Signal quality history** — last 10 packets shown as filled (✓) / outline (✗) boxes
+- **Frequency scanner** — sweeps 400–406 MHz in 0.1 MHz steps, bar-graph RSSI display
 - Frequency tunable from 400.1 to 406.0 MHz in 0.1 MHz steps
+- **External CC1101 support** — plug in a cheap CC1101 module on the GPIO SPI header
 
 ---
 
 ## Controls
+
+### Decoder view
 
 | Button | Action |
 |--------|--------|
 | **OK** | Start / stop reception |
 | **UP** | Increase frequency +0.1 MHz |
 | **DOWN** | Decrease frequency −0.1 MHz |
+| **RIGHT** | Switch to frequency scanner |
+| **LEFT** | Toggle radio source: built-in ↔ external CC1101 (only when stopped) |
+| **BACK** | Exit app |
+
+### Scanner view (RIGHT from decoder)
+
+| Button | Action |
+|--------|--------|
+| **UP / RIGHT** | Move cursor right (+0.1 MHz) |
+| **DOWN / LEFT** | Move cursor left (−0.1 MHz) |
+| **OK** | Tune to cursor frequency and return to decoder |
 | **BACK** | Exit app |
 
 ---
 
-## Display
+## Scanner display
 
 ```
-RS41  405.1 MHz [RX]
+Scan 400-406 MHz
 ────────────────────
+ ▌  ▌▌    ▌▌▌  ▌▌  ▌     (61-bar RSSI graph)
+────────────────────
+403.0 MHz  -84 dBm
+OK:decode  BACK:exit
+```
+
+Move the cursor with UP/DOWN.  Press OK to tune the decoder to that frequency.
+
+---
+
+## Display (decoder)
+
+```
+RS41  405.1 MHz [RX] IN
+────────────────────────
 ID:N1320638  -84dBm
 14.6685N  037.0377W
 Alt: 1460m T:+19.0C
 P: 849.1hPa Sats: 0
+─────────────────────
+■■■□□■■■□■              (signal quality: last 10 packets)
+OK:stop RT:scan UP/DN:freq
 ```
 
-Fields show `---` while waiting for calibration frames or GPS fix.
+- `IN` / `EX` in the header shows the active radio source.
+- Signal history row: filled box **■** = decoded OK, outline □ = failed.
+- Fields show `---` while waiting for calibration frames or GPS fix.
+
+---
+
+## External CC1101 wiring
+
+Connect a bare CC1101 module to the Flipper Zero GPIO header:
+
+| CC1101 pin | Flipper GPIO | Function       |
+|------------|--------------|----------------|
+| VCC        | Pin 3        | 3.3 V          |
+| GND        | Pin 2        | Ground         |
+| MOSI       | Pin 12       | SPI1 MOSI (PA7)|
+| MISO/GDO1  | Pin 13       | SPI1 MISO (PA6)|
+| SCK        | Pin 15       | SPI1 CLK  (PB3)|
+| CSN        | Pin 14       | SPI1 NSS  (PA4)|
+| GDO0       | Pin 7        | PC3 (optional) |
+
+Press **LEFT** on the idle decoder screen to toggle between built-in (`IN`) and
+external (`EX`) CC1101.  The setting takes effect at the next **OK** (start).
 
 ---
 
@@ -72,8 +128,8 @@ Each frame is 318 bytes in the FIFO (6 sync + 312 payload):
 
 1. **Bit-reversal** — MSB↔LSB swap on every byte
 2. **XOR descramble** — 64-byte repeating key, offset 8
-3. **Skip** bytes 0–47 (Reed-Solomon parity, not yet used) and byte 48 (frame type)
-4. **TLV block parsing** from byte 49, each validated with CRC-16/CCITT-FALSE:
+3. **Reed-Solomon correction** — RS(255,231) shortened to (156,132), two interleaved codewords, up to t=12 errors per codeword
+4. **Skip** byte 48 (frame type), then **TLV block parsing** from byte 49
 
 | Block ID | Name   | Decoded fields |
 |----------|--------|----------------|

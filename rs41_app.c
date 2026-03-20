@@ -38,50 +38,10 @@
 #include <string.h>
 
 #include "rs41_decoder.h"
+#include "radio_hw.h"
 
-/* ── Direct CC1101 FIFO access ───────────────────────────────────────────── */
-/*
- * furi_hal_subghz_read_packet() (via cc1101_read_fifo in firmware) silently
- * consumes the first byte from the FIFO as a length indicator (capped at 64),
- * then reads only that many bytes — losing one byte per call and reading a
- * random (payload-dependent) amount.  For a 318-byte infinite-mode frame this
- * completely garbles the data.
- *
- * Work-around: read RXBYTES directly, then burst-read exactly that many bytes
- * using furi_hal_spi_bus_trx / furi_hal_spi_bus_rx while holding CS via
- * furi_hal_spi_acquire / furi_hal_spi_release.
- *
- * CC1101 register addresses (with READ=0x80, BURST=0x40):
- *   RXBYTES status register : 0x80|0x40|0x3B = 0xFB
- *   FIFO burst-read         : 0x80|0x40|0x3F = 0xFF
- *   Bit 7 of RXBYTES        : RXFIFO_OVERFLOW flag
- */
-#define CC1101_RXBYTES_ADDR   0xFB
-#define CC1101_FIFO_BURST_RD  0xFF
+/* Bit 7 of RXBYTES register: set if RX FIFO has overflowed */
 #define CC1101_RXFIFO_OVERFLOW 0x80u
-
-/* Return raw RXBYTES register: bit7=overflow, bits6:0=bytes available */
-static uint8_t cc1101_rxbytes_direct(void) {
-    uint8_t cmd[2] = {CC1101_RXBYTES_ADDR, 0x00};
-    uint8_t resp[2] = {0, 0};
-    furi_hal_spi_acquire(&furi_hal_spi_bus_handle_subghz);
-    furi_hal_spi_bus_trx(&furi_hal_spi_bus_handle_subghz, cmd, resp, 2, 50);
-    furi_hal_spi_release(&furi_hal_spi_bus_handle_subghz);
-    return resp[1];
-}
-
-/* Burst-read exactly n bytes from the CC1101 RX FIFO into dst */
-static void cc1101_read_fifo_direct(uint8_t* dst, uint8_t n) {
-    if(n == 0) return;
-    uint8_t cmd = CC1101_FIFO_BURST_RD;
-    uint8_t status;
-    furi_hal_spi_acquire(&furi_hal_spi_bus_handle_subghz);
-    /* Send burst-read FIFO command; first byte back = CC1101 status */
-    furi_hal_spi_bus_trx(&furi_hal_spi_bus_handle_subghz, &cmd, &status, 1, 50);
-    /* CS stays asserted (within acquire/release); clock out n FIFO bytes */
-    furi_hal_spi_bus_rx(&furi_hal_spi_bus_handle_subghz, dst, n, 500);
-    furi_hal_spi_release(&furi_hal_spi_bus_handle_subghz);
-}
 
 /* ── CC1101 preset ───────────────────────────────────────────────────────── */
 /*
@@ -142,6 +102,8 @@ static const uint8_t CC1101_RS41_PRESET[] = {
 #define SCAN_CHANNELS   61    /* 400.0 – 406.0 MHz in 0.1 MHz steps        */
 #define SCAN_DWELL_MS   150   /* dwell time per channel during scan          */
 
+#define SIG_HIST_LEN    10   /* number of recent packet attempts to display */
+
 /* ── App view enum ───────────────────────────────────────────────────────── */
 typedef enum {
     AppViewDecoder = 0,
@@ -165,6 +127,7 @@ typedef struct {
     volatile float freq_mhz;
     bool           rx_active;   /* true = RX thread is started */
     volatile bool  scan_mode;   /* true = radio thread runs scanner */
+    RadioSource    radio_source; /* RadioInternal or RadioExternal */
 
     /* Latest decoded sonde data — access under mutex */
     Rs41Frame frame;
@@ -175,6 +138,14 @@ typedef struct {
     int8_t    scan_rssi[SCAN_CHANNELS]; /* last measured RSSI per channel    */
     int       scan_cursor;              /* highlighted channel index          */
     AppView   view;
+
+    /* Signal quality history — access under mutex.
+     * Ring buffer of last SIG_HIST_LEN frame decode attempts:
+     *   1 = decoded OK,  0 = decode failed / CRC error
+     * sig_head points to the next write position (oldest entry is at sig_head). */
+    uint8_t sig_hist[SIG_HIST_LEN];
+    uint8_t sig_head;
+    bool    sig_any;   /* true once at least one entry has been recorded */
 } AppCtx;
 
 #define TAG "RS41"
@@ -182,13 +153,13 @@ typedef struct {
 /* ── Radio thread ────────────────────────────────────────────────────────── */
 
 static void radio_start_rx(AppCtx* app) {
-    furi_hal_subghz_reset();
-    furi_hal_subghz_flush_rx();
-    furi_hal_subghz_load_custom_preset(CC1101_RS41_PRESET);
-    uint32_t actual = furi_hal_subghz_set_frequency_and_path((uint32_t)(app->freq_mhz * 1.0e6f));
-    FURI_LOG_I(TAG, "RX start: requested %.3f MHz, CC1101 tuned to %lu Hz",
-               (double)app->freq_mhz, (unsigned long)actual);
-    furi_hal_subghz_rx();
+    uint32_t freq_hz = (uint32_t)(app->freq_mhz * 1.0e6f);
+    radio_hw_init(app->radio_source, CC1101_RS41_PRESET);
+    radio_hw_set_frequency(app->radio_source, freq_hz);
+    FURI_LOG_I(TAG, "RX start [%s]: %.3f MHz",
+               app->radio_source == RadioInternal ? "INT" : "EXT",
+               (double)app->freq_mhz);
+    radio_hw_rx(app->radio_source);
 }
 
 static int32_t radio_thread_fn(void* ctx) {
@@ -198,10 +169,9 @@ static int32_t radio_thread_fn(void* ctx) {
     while(app->radio_running) {
         if(app->scan_mode) {
             /* ── Scanner mode ──────────────────────────────────────────── */
-            FURI_LOG_I(TAG, "Scanner started");
-            furi_hal_subghz_reset();
-            furi_hal_subghz_flush_rx();
-            furi_hal_subghz_load_custom_preset(CC1101_RS41_PRESET);
+            FURI_LOG_I(TAG, "Scanner started [%s]",
+                       app->radio_source == RadioInternal ? "INT" : "EXT");
+            radio_hw_init(app->radio_source, CC1101_RS41_PRESET);
 
             while(app->radio_running && app->scan_mode) {
                 for(int ch = 0; ch < SCAN_CHANNELS; ch++) {
@@ -210,12 +180,12 @@ static int32_t radio_thread_fn(void* ctx) {
                     uint32_t freq_hz = (uint32_t)((400.0f + ch * 0.1f) * 1.0e6f);
                     /* Must go IDLE before tuning — firmware furi_check asserts
                      * state==IDLE in furi_hal_subghz_rx().                    */
-                    furi_hal_subghz_idle();
-                    furi_hal_subghz_set_frequency_and_path(freq_hz);
-                    furi_hal_subghz_rx();
+                    radio_hw_idle(app->radio_source);
+                    radio_hw_set_frequency(app->radio_source, freq_hz);
+                    radio_hw_rx(app->radio_source);
                     furi_delay_ms(SCAN_DWELL_MS);
 
-                    float rssi_f = furi_hal_subghz_get_rssi();
+                    float rssi_f = radio_hw_get_rssi(app->radio_source);
                     int8_t rssi  = (int8_t)(rssi_f < -128.0f ? -128 :
                                             rssi_f >  127.0f ?  127 : rssi_f);
 
@@ -226,7 +196,7 @@ static int32_t radio_thread_fn(void* ctx) {
                     view_port_update(app->viewport);
                 }
             }
-            furi_hal_subghz_idle();
+            radio_hw_idle(app->radio_source);
             FURI_LOG_I(TAG, "Scanner stopped");
 
         } else {
@@ -254,7 +224,7 @@ static int32_t radio_thread_fn(void* ctx) {
                     radio_start_rx(app);
                 }
 
-                uint8_t rxbytes_reg = cc1101_rxbytes_direct();
+                uint8_t rxbytes_reg = radio_hw_rxbytes(app->radio_source);
 
                 if(rxbytes_reg & CC1101_RXFIFO_OVERFLOW) {
                     FURI_LOG_W(TAG, "FIFO overflow at buf=%u — restarting RX",
@@ -293,7 +263,7 @@ static int32_t radio_thread_fn(void* ctx) {
                 uint8_t  to_read = available;
                 if((uint16_t)to_read > space) to_read = (uint8_t)space;
 
-                cc1101_read_fifo_direct(fifo_buf + buf_idx, to_read);
+                radio_hw_read_fifo(app->radio_source, fifo_buf + buf_idx, to_read);
                 buf_idx += to_read;
 
                 FURI_LOG_D(TAG, "Read %u FIFO bytes → buf %u/%u",
@@ -301,7 +271,7 @@ static int32_t radio_thread_fn(void* ctx) {
 
                 if(buf_idx >= FRAME_FIFO_LEN) {
                     frames_rx++;
-                    int16_t rssi = (int16_t)furi_hal_subghz_get_rssi();
+                    int16_t rssi = (int16_t)radio_hw_get_rssi(app->radio_source);
                     FURI_LOG_I(TAG, "Frame #%lu captured (%u bytes), RSSI=%d dBm",
                                (unsigned long)frames_rx, (unsigned)buf_idx, (int)rssi);
 
@@ -336,6 +306,9 @@ static int32_t radio_thread_fn(void* ctx) {
                         app->frame           = decoded;
                         app->has_data        = true;
                         app->last_frame_tick = furi_get_tick();
+                        app->sig_hist[app->sig_head] = 1;
+                        app->sig_head = (app->sig_head + 1) % SIG_HIST_LEN;
+                        app->sig_any  = true;
                         furi_mutex_release(app->mutex);
 
                         view_port_update(app->viewport);
@@ -343,6 +316,12 @@ static int32_t radio_thread_fn(void* ctx) {
                     } else {
                         FURI_LOG_W(TAG, "Decode FAILED (frame #%lu) id='%.8s' has_gps=%d",
                                    (unsigned long)frames_rx, decoded.id, (int)decoded.has_gps);
+
+                        furi_mutex_acquire(app->mutex, FuriWaitForever);
+                        app->sig_hist[app->sig_head] = 0;
+                        app->sig_head = (app->sig_head + 1) % SIG_HIST_LEN;
+                        app->sig_any  = true;
+                        furi_mutex_release(app->mutex);
                     }
 
                     collecting = false;
@@ -351,14 +330,14 @@ static int32_t radio_thread_fn(void* ctx) {
                 }
             }
 
-            furi_hal_subghz_idle();
+            radio_hw_idle(app->radio_source);
             FURI_LOG_I(TAG, "Decoder stopped. frames_rx=%lu ok=%lu",
                        (unsigned long)frames_rx, (unsigned long)frames_ok);
         }
     }
 
-    furi_hal_subghz_idle();
-    furi_hal_subghz_sleep();
+    radio_hw_idle(app->radio_source);
+    radio_hw_sleep(app->radio_source);
     return 0;
 }
 
@@ -460,20 +439,28 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     canvas_draw_str(canvas, 38, 8, freq_str);
 
     if(app->rx_active)
-        canvas_draw_str(canvas, 106, 8, "[RX]");
+        canvas_draw_str(canvas, 97, 8, "[RX]");
+
+    /* Radio source indicator: small "IN"/"EX" at top right */
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 127, 8, AlignRight, AlignBottom,
+                            app->radio_source == RadioInternal ? "IN" : "EX");
+    canvas_set_font(canvas, FontPrimary);
 
     canvas_draw_line(canvas, 0, 10, 127, 10);
 
     /* ── Content ─────────────────────────────────────────────────────── */
     if(!app->rx_active && !app->has_data) {
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 24, AlignCenter, AlignCenter,
+        canvas_draw_str_aligned(canvas, 64, 22, AlignCenter, AlignCenter,
                                 "OK: start RX");
-        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter,
+        canvas_draw_str_aligned(canvas, 64, 31, AlignCenter, AlignCenter,
                                 "UP/DN: tune freq");
-        canvas_draw_str_aligned(canvas, 64, 46, AlignCenter, AlignCenter,
+        canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter,
                                 "RIGHT: freq scan");
-        canvas_draw_str_aligned(canvas, 64, 57, AlignCenter, AlignCenter,
+        canvas_draw_str_aligned(canvas, 64, 49, AlignCenter, AlignCenter,
+                                "LEFT: INT/EXT radio");
+        canvas_draw_str_aligned(canvas, 64, 58, AlignCenter, AlignCenter,
                                 "BACK: exit");
         return;
     }
@@ -542,8 +529,30 @@ static void draw_cb(Canvas* canvas, void* ctx) {
         }
     }
 
+    /* Signal quality history bar — 10 × 4px boxes below data rows */
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    bool     sig_any  = app->sig_any;
+    uint8_t  sig_head = app->sig_head;
+    uint8_t  hist_copy[SIG_HIST_LEN];
+    memcpy(hist_copy, app->sig_hist, SIG_HIST_LEN);
+    furi_mutex_release(app->mutex);
+
+    if(sig_any) {
+        canvas_draw_line(canvas, 0, 49, 127, 49);
+        /* Left = oldest entry, right = newest entry */
+        for(int i = 0; i < SIG_HIST_LEN; i++) {
+            /* sig_head is next-write, so sig_head+i wraps to the oldest */
+            int idx = (sig_head + i) % SIG_HIST_LEN;
+            int x   = i * 5;   /* 4px box + 1px gap */
+            if(hist_copy[idx])
+                canvas_draw_box(canvas, x, 51, 4, 4);   /* filled = OK */
+            else
+                canvas_draw_frame(canvas, x, 51, 4, 4); /* outline = fail */
+        }
+    }
+
     /* Status hint at bottom */
-    canvas_draw_str(canvas, 0, 62, "OK:stop RT:scan UP/DN:freq");
+    canvas_draw_str(canvas, 0, 63, "OK:stop RT:scan UP/DN:freq");
 }
 
 /* ── Input callback (called from GUI thread) ─────────────────────────────── */
@@ -566,6 +575,10 @@ int32_t rs41_app(void* p) {
     app->scan_mode        = false;
     app->scan_cursor      = 31; /* start at ~403 MHz */
     app->view             = AppViewDecoder;
+    app->radio_source     = RadioInternal;
+    app->sig_any          = false;
+    app->sig_head         = 0;
+    memset(app->sig_hist, 0, sizeof(app->sig_hist));
     for(int i = 0; i < SCAN_CHANNELS; i++) app->scan_rssi[i] = -120;
 
     /* Mutex for sonde state */
@@ -680,6 +693,17 @@ int32_t rs41_app(void* p) {
                     app->radio_thread  = furi_thread_alloc_ex(
                         "RS41Radio", 4096, radio_thread_fn, app);
                     furi_thread_start(app->radio_thread);
+                }
+                view_port_update(app->viewport);
+                break;
+
+            case InputKeyLeft:
+                /* Toggle radio source when RX is not active */
+                if(!app->rx_active) {
+                    app->radio_source = (app->radio_source == RadioInternal)
+                                        ? RadioExternal : RadioInternal;
+                    FURI_LOG_I(TAG, "Radio source -> %s",
+                               app->radio_source == RadioInternal ? "INT" : "EXT");
                 }
                 view_port_update(app->viewport);
                 break;
