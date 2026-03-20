@@ -110,9 +110,9 @@ external (`EX`) CC1101.  The setting takes effect at the next **OK** (start).
 The CC1101 outputs bits MSB-first; RS41 transmits LSB-first.
 Each FIFO byte is bit-reversed, then XOR-descrambled with a 64-byte key.
 
-> **Note:** The Flipper firmware's `furi_hal_subghz_read_packet()` silently
-> consumes the first FIFO byte as a length field, corrupting 318-byte frames.
-> This app bypasses it with direct SPI FIFO reads.
+**Note:** The Flipper firmware's `furi_hal_subghz_read_packet()` silently
+consumes the first FIFO byte as a length field, corrupting 318-byte frames.
+This app bypasses it with direct SPI FIFO reads.
 
 
 ## RS41 frame decoding
