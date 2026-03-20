@@ -108,6 +108,7 @@ static const uint8_t CC1101_RS41_PRESET[] = {
 typedef enum {
     AppViewDecoder = 0,
     AppViewScanner,
+    AppViewHelp,
 } AppView;
 
 /* ── App state ───────────────────────────────────────────────────────────── */
@@ -346,6 +347,41 @@ static int32_t radio_thread_fn(void* ctx) {
 /* Format a coordinate: "50.0745N" or "014.4189E" */
 static void fmt_coord(char* buf, size_t sz, float val, char pos, char neg);
 
+/* ── Help view ───────────────────────────────────────────────────────────── */
+/*
+ * Shows external CC1101 module pin wiring.
+ * Opened by long-pressing LEFT in the decoder view; any key dismisses.
+ */
+static void draw_help_cb(Canvas* canvas) {
+    canvas_clear(canvas);
+    canvas_set_color(canvas, ColorBlack);
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 0, 8, "Ext CC1101 wiring");
+    canvas_draw_line(canvas, 0, 10, 127, 10);
+
+    canvas_set_font(canvas, FontSecondary);
+    /* Two-column table: signal name | Flipper pin */
+    static const char* const rows[][2] = {
+        {"VCC  ", "Pin 3  (3.3V)"},
+        {"GND  ", "Pin 2  (GND) "},
+        {"MOSI ", "Pin 12 (PA7) "},
+        {"MISO ", "Pin 13 (PA6) "},
+        {"SCK  ", "Pin 15 (PB3) "},
+        {"CSN  ", "Pin 14 (PA4) "},
+        {"GDO0 ", "Pin 7  (PC3) "},
+    };
+    for(int i = 0; i < 7; i++) {
+        int y = 20 + i * 7;
+        canvas_draw_str(canvas, 0,  y, rows[i][0]);
+        canvas_draw_str(canvas, 30, y, rows[i][1]);
+    }
+
+    canvas_draw_line(canvas, 0, 61, 127, 61);
+    canvas_draw_str_aligned(canvas, 64, 63, AlignCenter, AlignBottom,
+                            "any key: back");
+}
+
 /* ── Scanner view ─────────────────────────────────────────────────────────── */
 /*
  * Bar graph: 61 bars × 2px = 122px wide, centred in 128px (3px margins).
@@ -427,6 +463,11 @@ static void draw_cb(Canvas* canvas, void* ctx) {
         return;
     }
 
+    if(app->view == AppViewHelp) {
+        draw_help_cb(canvas);
+        return;
+    }
+
     canvas_clear(canvas);
     canvas_set_color(canvas, ColorBlack);
 
@@ -459,7 +500,7 @@ static void draw_cb(Canvas* canvas, void* ctx) {
         canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter,
                                 "RIGHT: freq scan");
         canvas_draw_str_aligned(canvas, 64, 49, AlignCenter, AlignCenter,
-                                "LEFT: INT/EXT radio");
+                                "LEFT: INT/EXT  L-LEFT:?");
         canvas_draw_str_aligned(canvas, 64, 58, AlignCenter, AlignCenter,
                                 "BACK: exit");
         return;
@@ -605,7 +646,16 @@ int32_t rs41_app(void* p) {
         InputEvent event;
         FuriStatus status = furi_message_queue_get(app->input_queue, &event, 100);
 
-        if(status != FuriStatusOk || event.type != InputTypeShort) continue;
+        if(status != FuriStatusOk) continue;
+        /* Accept short presses and long presses; ignore repeat / release */
+        if(event.type != InputTypeShort && event.type != InputTypeLong) continue;
+
+        /* ── Help view: any key dismisses ────────────────────────────── */
+        if(app->view == AppViewHelp) {
+            app->view = AppViewDecoder;
+            view_port_update(app->viewport);
+            continue;
+        }
 
         if(app->view == AppViewScanner) {
             /* ── Scanner controls ─────────────────────────────────── */
@@ -698,8 +748,11 @@ int32_t rs41_app(void* p) {
                 break;
 
             case InputKeyLeft:
-                /* Toggle radio source when RX is not active */
-                if(!app->rx_active) {
+                if(event.type == InputTypeLong) {
+                    /* Long LEFT: show pin wiring help */
+                    app->view = AppViewHelp;
+                } else if(!app->rx_active) {
+                    /* Short LEFT: toggle radio source */
                     app->radio_source = (app->radio_source == RadioInternal)
                                         ? RadioExternal : RadioInternal;
                     FURI_LOG_I(TAG, "Radio source -> %s",
