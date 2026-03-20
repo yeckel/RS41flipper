@@ -23,7 +23,7 @@ Developed by OK1CHP, inspired by [twatch-rs41](https://github.com/yeckel/twatch-
 
 ## Controls
 
-### Decoder view
+## Decoder view
 
 | Button | Action |
 |--------|--------|
@@ -34,7 +34,7 @@ Developed by OK1CHP, inspired by [twatch-rs41](https://github.com/yeckel/twatch-
 | **LEFT** | Toggle radio source: built-in ↔ external CC1101 (only when stopped) |
 | **BACK** | Exit app |
 
-### Scanner view (RIGHT from decoder)
+## Scanner view (RIGHT from decoder)
 
 | Button | Action |
 |--------|--------|
@@ -130,7 +130,7 @@ Each frame is 318 bytes in the FIFO (6 sync + 312 payload):
 | `0x7A`   | PTU    | Temperature and pressure ADC measurements (uint24 LE × 3) |
 | `0x7B`   | GPS    | ECEF position (int32 × 0.01 m) → WGS-84 via Bowring iteration |
 
-### Temperature calibration (calframes 3–6)
+## Temperature calibration (calframes 3–6)
 
 The sonde embeds calibration constants in the STATUS block, 16 bytes per frame,
 rotating through 51 calframe indices.  Four consecutive calframes (3, 4, 5, 6)
@@ -145,7 +145,7 @@ R  = Rc · calT1[0]
 T  = (co1[0] + co1[1]·R + co1[2]·R²  + calT1[1]) · (1 + calT1[2])
 ```
 
-### Pressure calibration (calframes 6–7, RS41-SGP only)
+## Pressure calibration (calframes 6–7, RS41-SGP only)
 
 Same resistive-bridge structure as temperature, using `Fp1`, `Fp2`, `Cp[3]`:
 ```
