@@ -208,6 +208,9 @@ static int32_t radio_thread_fn(void* ctx) {
                     if(!app->radio_running || !app->scan_mode) break;
 
                     uint32_t freq_hz = (uint32_t)((400.0f + ch * 0.1f) * 1.0e6f);
+                    /* Must go IDLE before tuning — firmware furi_check asserts
+                     * state==IDLE in furi_hal_subghz_rx().                    */
+                    furi_hal_subghz_idle();
                     furi_hal_subghz_set_frequency_and_path(freq_hz);
                     furi_hal_subghz_rx();
                     furi_delay_ms(SCAN_DWELL_MS);
@@ -421,7 +424,7 @@ static void draw_scanner_cb(Canvas* canvas, AppCtx* app) {
     canvas_draw_str(canvas, 0, 58, info);
 
     /* Hint */
-    canvas_draw_str(canvas, 0, 64, "OK:decode  BACK:exit");
+    canvas_draw_str(canvas, 0, 64, "LR:move  OK:tune+decode");
 }
 
 /* ── Decoder/scanner dispatcher ─────────────────────────────────────────── */
@@ -464,21 +467,25 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     /* ── Content ─────────────────────────────────────────────────────── */
     if(!app->rx_active && !app->has_data) {
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 32, AlignCenter, AlignCenter,
-                                "Press OK to start");
-        canvas_draw_str_aligned(canvas, 64, 44, AlignCenter, AlignCenter,
-                                "UP/DN: change freq");
+        canvas_draw_str_aligned(canvas, 64, 24, AlignCenter, AlignCenter,
+                                "OK: start RX");
+        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter,
+                                "UP/DN: tune freq");
+        canvas_draw_str_aligned(canvas, 64, 46, AlignCenter, AlignCenter,
+                                "RIGHT: freq scan");
+        canvas_draw_str_aligned(canvas, 64, 57, AlignCenter, AlignCenter,
+                                "BACK: exit");
         return;
     }
 
     if(app->rx_active && !app->has_data) {
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 30, AlignCenter, AlignCenter,
+        canvas_draw_str_aligned(canvas, 64, 26, AlignCenter, AlignCenter,
                                 "Searching...");
-        canvas_draw_str_aligned(canvas, 64, 42, AlignCenter, AlignCenter,
-                                "UP/DN: change freq");
-        canvas_draw_str_aligned(canvas, 64, 54, AlignCenter, AlignCenter,
-                                "OK: stop  BACK: exit");
+        canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignCenter,
+                                "RIGHT: freq scan");
+        canvas_draw_str_aligned(canvas, 64, 50, AlignCenter, AlignCenter,
+                                "OK:stop  BACK:exit");
         return;
     }
 
@@ -536,7 +543,7 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     }
 
     /* Status hint at bottom */
-    canvas_draw_str(canvas, 0, 62, "OK:stop UP/DN:freq RT:scan");
+    canvas_draw_str(canvas, 0, 62, "OK:stop RT:scan UP/DN:freq");
 }
 
 /* ── Input callback (called from GUI thread) ─────────────────────────────── */
@@ -663,10 +670,17 @@ int32_t rs41_app(void* p) {
                 break;
 
             case InputKeyRight:
-                /* Switch to frequency scanner */
+                /* Switch to frequency scanner; start radio thread if needed */
                 for(int i = 0; i < SCAN_CHANNELS; i++) app->scan_rssi[i] = -120;
                 app->scan_mode = true;
                 app->view      = AppViewScanner;
+                if(!app->rx_active) {
+                    app->radio_running = true;
+                    app->rx_active     = true;
+                    app->radio_thread  = furi_thread_alloc_ex(
+                        "RS41Radio", 4096, radio_thread_fn, app);
+                    furi_thread_start(app->radio_thread);
+                }
                 view_port_update(app->viewport);
                 break;
 
