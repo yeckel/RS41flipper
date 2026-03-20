@@ -58,7 +58,7 @@ Move the cursor with UP/DOWN.  Press OK to tune the decoder to that frequency.
 
 ## Display (decoder)
 
-RS41  405.1 MHz [RX] IN
+RS41  405.1 MHz (RX) IN
 ────────────────────────
 ID:N1320638  -84dBm
 14.6685N  037.0377W
@@ -130,22 +130,22 @@ Each frame is 318 bytes in the FIFO (6 sync + 312 payload):
 
 The sonde embeds calibration constants in the STATUS block, 16 bytes per frame,
 rotating through 51 calframe indices.  Four consecutive calframes (3, 4, 5, 6)
-are needed to assemble Rf1, Rf2, co1[3], calT1[3].
+are needed to assemble Rf1, Rf2, co1(3), calT1(3).
 
 Formula (rs1729 / rs41ptu.c algorithm):
 g  = (f2 - f1) / (Rf2 - Rf1)
 Rb = (f1·Rf2 - f2·Rf1) / (f2 - f1)
-Rc = meas[0] / g - Rb
-R  = Rc · calT1[0]
-T  = (co1[0] + co1[1]·R + co1[2]·R²  + calT1[1]) · (1 + calT1[2])
+Rc = meas(0) / g - Rb
+R  = Rc · calT1(0)
+T  = (co1(0) + co1(1)·R + co1(2)·R²  + calT1(1)) · (1 + calT1(2))
 
 ## Pressure calibration (calframes 6–7, RS41-SGP only)
 
-Same resistive-bridge structure as temperature, using Fp1, Fp2, Cp[3]:
+Same resistive-bridge structure as temperature, using Fp1, Fp2, Cp(3):
 g  = (fp2 - fp1) / (Fp2 - Fp1)
 Rb = (fp1·Fp2 - fp2·Fp1) / (fp2 - fp1)
-Rc = meas[3] / g - Rb
-P  = Cp[0] + Cp[1]·Rc + Cp[2]·Rc²     (hPa)
+Rc = meas(3) / g - Rb
+P  = Cp(0) + Cp(1)·Rc + Cp(2)·Rc²     (hPa)
 
 
 ## Build & deploy
