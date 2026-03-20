@@ -139,6 +139,15 @@ static const uint8_t CC1101_RS41_PRESET[] = {
 #define FREQ_DEFAULT   403.0f
 #define RX_TIMEOUT_MS  2500   /* restart if no new FIFO bytes for this long */
 
+#define SCAN_CHANNELS   61    /* 400.0 – 406.0 MHz in 0.1 MHz steps        */
+#define SCAN_DWELL_MS   150   /* dwell time per channel during scan          */
+
+/* ── App view enum ───────────────────────────────────────────────────────── */
+typedef enum {
+    AppViewDecoder = 0,
+    AppViewScanner,
+} AppView;
+
 /* ── App state ───────────────────────────────────────────────────────────── */
 typedef struct {
     /* GUI */
@@ -155,11 +164,17 @@ typedef struct {
     /* Radio config (written by main thread, read by radio thread) */
     volatile float freq_mhz;
     bool           rx_active;   /* true = RX thread is started */
+    volatile bool  scan_mode;   /* true = radio thread runs scanner */
 
     /* Latest decoded sonde data — access under mutex */
     Rs41Frame frame;
     bool      has_data;
     uint32_t  last_frame_tick;
+
+    /* Scanner state — access under mutex */
+    int8_t    scan_rssi[SCAN_CHANNELS]; /* last measured RSSI per channel    */
+    int       scan_cursor;              /* highlighted channel index          */
+    AppView   view;
 } AppCtx;
 
 #define TAG "RS41"
@@ -178,137 +193,167 @@ static void radio_start_rx(AppCtx* app) {
 
 static int32_t radio_thread_fn(void* ctx) {
     AppCtx* app = (AppCtx*)ctx;
-
-    uint8_t  fifo_buf[FRAME_FIFO_LEN];
-    uint16_t buf_idx       = 0;
-    uint32_t last_byte_ms  = 0;
-    bool     collecting    = false;
-    float    last_freq     = 0.0f;
-    uint32_t frames_rx     = 0;   /* raw frames captured */
-    uint32_t frames_ok     = 0;   /* successfully decoded */
-
     FURI_LOG_I(TAG, "Radio thread started");
-    radio_start_rx(app);
-    last_freq = app->freq_mhz;
 
     while(app->radio_running) {
-        /* If frequency changed, restart RX */
-        float cur_freq = app->freq_mhz;
-        if(cur_freq != last_freq) {
-            FURI_LOG_I(TAG, "Freq change: %.3f -> %.3f MHz",
-                       (double)last_freq, (double)cur_freq);
-            last_freq  = cur_freq;
-            collecting = false;
-            buf_idx    = 0;
+        if(app->scan_mode) {
+            /* ── Scanner mode ──────────────────────────────────────────── */
+            FURI_LOG_I(TAG, "Scanner started");
+            furi_hal_subghz_reset();
+            furi_hal_subghz_flush_rx();
+            furi_hal_subghz_load_custom_preset(CC1101_RS41_PRESET);
+
+            while(app->radio_running && app->scan_mode) {
+                for(int ch = 0; ch < SCAN_CHANNELS; ch++) {
+                    if(!app->radio_running || !app->scan_mode) break;
+
+                    uint32_t freq_hz = (uint32_t)((400.0f + ch * 0.1f) * 1.0e6f);
+                    furi_hal_subghz_set_frequency_and_path(freq_hz);
+                    furi_hal_subghz_rx();
+                    furi_delay_ms(SCAN_DWELL_MS);
+
+                    float rssi_f = furi_hal_subghz_get_rssi();
+                    int8_t rssi  = (int8_t)(rssi_f < -128.0f ? -128 :
+                                            rssi_f >  127.0f ?  127 : rssi_f);
+
+                    furi_mutex_acquire(app->mutex, FuriWaitForever);
+                    app->scan_rssi[ch] = rssi;
+                    furi_mutex_release(app->mutex);
+
+                    view_port_update(app->viewport);
+                }
+            }
+            furi_hal_subghz_idle();
+            FURI_LOG_I(TAG, "Scanner stopped");
+
+        } else {
+            /* ── Decoder mode ──────────────────────────────────────────── */
+            uint8_t  fifo_buf[FRAME_FIFO_LEN];
+            uint16_t buf_idx      = 0;
+            uint32_t last_byte_ms = 0;
+            bool     collecting   = false;
+            float    last_freq    = 0.0f;
+            uint32_t frames_rx    = 0;
+            uint32_t frames_ok    = 0;
+
             radio_start_rx(app);
-        }
+            last_freq = app->freq_mhz;
 
-        /* Read RXBYTES directly — avoids furi_hal_subghz_read_packet which
-         * silently consumes the first FIFO byte as a length indicator.      */
-        uint8_t rxbytes_reg = cc1101_rxbytes_direct();
+            while(app->radio_running && !app->scan_mode) {
+                /* Retune if frequency changed */
+                float cur_freq = app->freq_mhz;
+                if(cur_freq != last_freq) {
+                    FURI_LOG_I(TAG, "Freq change: %.3f -> %.3f MHz",
+                               (double)last_freq, (double)cur_freq);
+                    last_freq  = cur_freq;
+                    collecting = false;
+                    buf_idx    = 0;
+                    radio_start_rx(app);
+                }
 
-        /* FIFO overflow: flush and restart */
-        if(rxbytes_reg & CC1101_RXFIFO_OVERFLOW) {
-            FURI_LOG_W(TAG, "FIFO overflow at buf=%u — restarting RX", (unsigned)buf_idx);
-            collecting = false;
-            buf_idx    = 0;
-            radio_start_rx(app);
-            furi_delay_ms(2);
-            continue;
-        }
+                uint8_t rxbytes_reg = cc1101_rxbytes_direct();
 
-        uint8_t available = rxbytes_reg & 0x7F;
-
-        if(available == 0) {
-            if(collecting) {
-                if(furi_get_tick() - last_byte_ms > RX_TIMEOUT_MS) {
-                    FURI_LOG_W(TAG, "Frame timeout after %u bytes — restarting RX",
+                if(rxbytes_reg & CC1101_RXFIFO_OVERFLOW) {
+                    FURI_LOG_W(TAG, "FIFO overflow at buf=%u — restarting RX",
                                (unsigned)buf_idx);
+                    collecting = false;
+                    buf_idx    = 0;
+                    radio_start_rx(app);
+                    furi_delay_ms(2);
+                    continue;
+                }
+
+                uint8_t available = rxbytes_reg & 0x7F;
+
+                if(available == 0) {
+                    if(collecting) {
+                        if(furi_get_tick() - last_byte_ms > RX_TIMEOUT_MS) {
+                            FURI_LOG_W(TAG, "Frame timeout after %u bytes — restarting RX",
+                                       (unsigned)buf_idx);
+                            collecting = false;
+                            buf_idx    = 0;
+                            radio_start_rx(app);
+                        }
+                    }
+                    furi_delay_ms(2);
+                    continue;
+                }
+
+                if(!collecting) {
+                    FURI_LOG_I(TAG, "Sync found — collecting frame (%u bytes already in FIFO)",
+                               (unsigned)available);
+                    collecting = true;
+                }
+                last_byte_ms = furi_get_tick();
+
+                uint16_t space   = FRAME_FIFO_LEN - buf_idx;
+                uint8_t  to_read = available;
+                if((uint16_t)to_read > space) to_read = (uint8_t)space;
+
+                cc1101_read_fifo_direct(fifo_buf + buf_idx, to_read);
+                buf_idx += to_read;
+
+                FURI_LOG_D(TAG, "Read %u FIFO bytes → buf %u/%u",
+                           (unsigned)to_read, (unsigned)buf_idx, FRAME_FIFO_LEN);
+
+                if(buf_idx >= FRAME_FIFO_LEN) {
+                    frames_rx++;
+                    int16_t rssi = (int16_t)furi_hal_subghz_get_rssi();
+                    FURI_LOG_I(TAG, "Frame #%lu captured (%u bytes), RSSI=%d dBm",
+                               (unsigned long)frames_rx, (unsigned)buf_idx, (int)rssi);
+
+                    FURI_LOG_I(TAG, "Sync bytes: %02X %02X %02X %02X %02X %02X",
+                               fifo_buf[0], fifo_buf[1], fifo_buf[2],
+                               fifo_buf[3], fifo_buf[4], fifo_buf[5]);
+
+                    const uint8_t* p = fifo_buf + 6;
+                    FURI_LOG_I(TAG, "Raw[0..15]: %02X %02X %02X %02X %02X %02X %02X %02X"
+                                     " %02X %02X %02X %02X %02X %02X %02X %02X",
+                               p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
+                               p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
+
+                    const uint8_t* q = fifo_buf + 6 + 44;
+                    FURI_LOG_I(TAG, "Raw[44..57]: %02X %02X %02X %02X %02X %02X %02X %02X"
+                                     " %02X %02X %02X %02X %02X %02X",
+                               q[0],q[1],q[2],q[3],q[4],q[5],q[6],q[7],
+                               q[8],q[9],q[10],q[11],q[12],q[13]);
+
+                    Rs41Frame decoded;
+                    bool ok = rs41_decode(fifo_buf + 6, rssi, &decoded);
+                    if(ok) {
+                        frames_ok++;
+                        FURI_LOG_I(TAG, "DECODE OK #%lu: id=%.8s lat=%.4f lon=%.4f"
+                                        " alt=%.0f sats=%u T=%.1f P=%.1f",
+                                   (unsigned long)frames_ok,
+                                   decoded.id, (double)decoded.lat, (double)decoded.lon,
+                                   (double)decoded.alt, (unsigned)decoded.sats,
+                                   (double)decoded.temp, (double)decoded.pres);
+
+                        furi_mutex_acquire(app->mutex, FuriWaitForever);
+                        app->frame           = decoded;
+                        app->has_data        = true;
+                        app->last_frame_tick = furi_get_tick();
+                        furi_mutex_release(app->mutex);
+
+                        view_port_update(app->viewport);
+                        notification_message(app->notifications, &sequence_blink_green_10);
+                    } else {
+                        FURI_LOG_W(TAG, "Decode FAILED (frame #%lu) id='%.8s' has_gps=%d",
+                                   (unsigned long)frames_rx, decoded.id, (int)decoded.has_gps);
+                    }
+
                     collecting = false;
                     buf_idx    = 0;
                     radio_start_rx(app);
                 }
             }
-            furi_delay_ms(2);
-            continue;
-        }
 
-        /* Bytes available in FIFO */
-        if(!collecting) {
-            FURI_LOG_I(TAG, "Sync found — collecting frame (%u bytes already in FIFO)",
-                       (unsigned)available);
-            collecting   = true;
-        }
-        last_byte_ms = furi_get_tick();
-
-        /* How many to pull: available (≤64) but no more than remaining space */
-        uint16_t space   = FRAME_FIFO_LEN - buf_idx;
-        uint8_t  to_read = available;
-        if((uint16_t)to_read > space) to_read = (uint8_t)space;
-
-        cc1101_read_fifo_direct(fifo_buf + buf_idx, to_read);
-        buf_idx += to_read;
-
-        FURI_LOG_D(TAG, "Read %u FIFO bytes → buf %u/%u",
-                   (unsigned)to_read, (unsigned)buf_idx, FRAME_FIFO_LEN);
-
-        if(buf_idx >= FRAME_FIFO_LEN) {
-            frames_rx++;
-            int16_t rssi = (int16_t)furi_hal_subghz_get_rssi();
-            FURI_LOG_I(TAG, "Frame #%lu captured (%u bytes), RSSI=%d dBm",
-                       (unsigned long)frames_rx, (unsigned)buf_idx, (int)rssi);
-
-            /* Log the 6 FIFO sync bytes (should be 53 88 44 69 48 1F) */
-            FURI_LOG_I(TAG, "Sync bytes: %02X %02X %02X %02X %02X %02X",
-                       fifo_buf[0], fifo_buf[1], fifo_buf[2],
-                       fifo_buf[3], fifo_buf[4], fifo_buf[5]);
-
-            /* Log raw bytes 0-15 of payload */
-            const uint8_t* p = fifo_buf + 6;
-            FURI_LOG_I(TAG, "Raw[0..15]: %02X %02X %02X %02X %02X %02X %02X %02X"
-                             " %02X %02X %02X %02X %02X %02X %02X %02X",
-                       p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
-                       p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
-
-            /* Log raw bytes 44-57 — frame type (byte 48) and first block start */
-            const uint8_t* q = fifo_buf + 6 + 44;
-            FURI_LOG_I(TAG, "Raw[44..57]: %02X %02X %02X %02X %02X %02X %02X %02X"
-                             " %02X %02X %02X %02X %02X %02X",
-                       q[0],q[1],q[2],q[3],q[4],q[5],q[6],q[7],
-                       q[8],q[9],q[10],q[11],q[12],q[13]);
-
-            Rs41Frame decoded;
-            bool ok = rs41_decode(fifo_buf + 6, rssi, &decoded);
-            if(ok) {
-                frames_ok++;
-                FURI_LOG_I(TAG, "DECODE OK #%lu: id=%.8s lat=%.4f lon=%.4f alt=%.0f sats=%u T=%.1f P=%.1f",
-                           (unsigned long)frames_ok,
-                           decoded.id, (double)decoded.lat, (double)decoded.lon,
-                           (double)decoded.alt, (unsigned)decoded.sats,
-                           (double)decoded.temp, (double)decoded.pres);
-
-                furi_mutex_acquire(app->mutex, FuriWaitForever);
-                app->frame           = decoded;
-                app->has_data        = true;
-                app->last_frame_tick = furi_get_tick();
-                furi_mutex_release(app->mutex);
-
-                view_port_update(app->viewport);
-                notification_message(app->notifications, &sequence_blink_green_10);
-            } else {
-                FURI_LOG_W(TAG, "Decode FAILED (frame #%lu) id='%.8s' has_gps=%d",
-                           (unsigned long)frames_rx, decoded.id, (int)decoded.has_gps);
-            }
-
-            /* Restart for next frame */
-            collecting = false;
-            buf_idx    = 0;
-            radio_start_rx(app);
+            furi_hal_subghz_idle();
+            FURI_LOG_I(TAG, "Decoder stopped. frames_rx=%lu ok=%lu",
+                       (unsigned long)frames_rx, (unsigned long)frames_ok);
         }
     }
 
-    FURI_LOG_I(TAG, "Radio thread stopping. frames_rx=%lu ok=%lu",
-               (unsigned long)frames_rx, (unsigned long)frames_ok);
     furi_hal_subghz_idle();
     furi_hal_subghz_sleep();
     return 0;
@@ -317,6 +362,69 @@ static int32_t radio_thread_fn(void* ctx) {
 /* ── Display helpers ─────────────────────────────────────────────────────── */
 
 /* Format a coordinate: "50.0745N" or "014.4189E" */
+static void fmt_coord(char* buf, size_t sz, float val, char pos, char neg);
+
+/* ── Scanner view ─────────────────────────────────────────────────────────── */
+/*
+ * Bar graph: 61 bars × 2px = 122px wide, centred in 128px (3px margins).
+ * RSSI mapped from [−120, −40] dBm → [0, 36] pixels height.
+ * The selected (cursor) channel is drawn inverted (white bar on black box).
+ */
+static void draw_scanner_cb(Canvas* canvas, AppCtx* app) {
+    canvas_clear(canvas);
+    canvas_set_color(canvas, ColorBlack);
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 0, 8, "Scan 400-406 MHz");
+    canvas_draw_line(canvas, 0, 10, 127, 10);
+
+    /* Read scan data under mutex */
+    int8_t rssi_copy[SCAN_CHANNELS];
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    memcpy(rssi_copy, app->scan_rssi, sizeof(rssi_copy));
+    int cursor = app->scan_cursor;
+    furi_mutex_release(app->mutex);
+
+    /* Bar graph: y=12 (top) to y=47 (bottom baseline), 36 px total height */
+    for(int ch = 0; ch < SCAN_CHANNELS; ch++) {
+        int val    = (int)rssi_copy[ch] + 120; /* 0 at −120 dBm */
+        int height = val * 36 / 80;
+        if(height < 0)  height = 0;
+        if(height > 36) height = 36;
+
+        int x     = 3 + ch * 2;
+        int y_top = 47 - height;
+
+        if(ch == cursor) {
+            /* Inverted: fill full column, then draw signal bar in white */
+            canvas_draw_box(canvas, x, 12, 2, 36);
+            if(height > 0) {
+                canvas_set_color(canvas, ColorWhite);
+                canvas_draw_box(canvas, x, y_top, 2, height);
+                canvas_set_color(canvas, ColorBlack);
+            }
+        } else {
+            if(height > 0)
+                canvas_draw_box(canvas, x, y_top, 2, height);
+        }
+    }
+
+    /* Separator below bar graph */
+    canvas_draw_line(canvas, 0, 49, 127, 49);
+
+    /* Info row: selected channel frequency + RSSI */
+    canvas_set_font(canvas, FontSecondary);
+    char info[32];
+    float cursor_mhz = 400.0f + (float)cursor * 0.1f;
+    snprintf(info, sizeof(info), "%.1f MHz  %d dBm",
+             (double)cursor_mhz, (int)rssi_copy[cursor]);
+    canvas_draw_str(canvas, 0, 58, info);
+
+    /* Hint */
+    canvas_draw_str(canvas, 0, 64, "OK:decode  BACK:exit");
+}
+
+/* ── Decoder/scanner dispatcher ─────────────────────────────────────────── */
 static void fmt_coord(char* buf, size_t sz, float val, char pos, char neg) {
     char sign     = (val >= 0.0f) ? pos : neg;
     float abs_val = fabsf(val);
@@ -331,6 +439,11 @@ static void fmt_coord(char* buf, size_t sz, float val, char pos, char neg) {
 
 static void draw_cb(Canvas* canvas, void* ctx) {
     AppCtx* app = (AppCtx*)ctx;
+
+    if(app->view == AppViewScanner) {
+        draw_scanner_cb(canvas, app);
+        return;
+    }
 
     canvas_clear(canvas);
     canvas_set_color(canvas, ColorBlack);
@@ -423,7 +536,7 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     }
 
     /* Status hint at bottom */
-    canvas_draw_str(canvas, 0, 62, "OK:stop UP/DN:freq BACK:exit");
+    canvas_draw_str(canvas, 0, 62, "OK:stop UP/DN:freq RT:scan");
 }
 
 /* ── Input callback (called from GUI thread) ─────────────────────────────── */
@@ -443,6 +556,10 @@ int32_t rs41_app(void* p) {
     app->rx_active        = false;
     app->has_data         = false;
     app->last_frame_tick  = 0;
+    app->scan_mode        = false;
+    app->scan_cursor      = 31; /* start at ~403 MHz */
+    app->view             = AppViewDecoder;
+    for(int i = 0; i < SCAN_CHANNELS; i++) app->scan_rssi[i] = -120;
 
     /* Mutex for sonde state */
     app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
@@ -468,7 +585,42 @@ int32_t rs41_app(void* p) {
         InputEvent event;
         FuriStatus status = furi_message_queue_get(app->input_queue, &event, 100);
 
-        if(status == FuriStatusOk && event.type == InputTypeShort) {
+        if(status != FuriStatusOk || event.type != InputTypeShort) continue;
+
+        if(app->view == AppViewScanner) {
+            /* ── Scanner controls ─────────────────────────────────── */
+            switch(event.key) {
+
+            case InputKeyBack:
+                running = false;
+                break;
+
+            case InputKeyOk:
+                /* Tune to cursor frequency and switch to decoder */
+                app->freq_mhz = 400.0f + (float)app->scan_cursor * 0.1f;
+                app->scan_mode = false;
+                app->view = AppViewDecoder;
+                view_port_update(app->viewport);
+                break;
+
+            case InputKeyUp:
+            case InputKeyRight:
+                if(app->scan_cursor < SCAN_CHANNELS - 1) app->scan_cursor++;
+                view_port_update(app->viewport);
+                break;
+
+            case InputKeyDown:
+            case InputKeyLeft:
+                if(app->scan_cursor > 0) app->scan_cursor--;
+                view_port_update(app->viewport);
+                break;
+
+            default:
+                break;
+            }
+
+        } else {
+            /* ── Decoder controls ─────────────────────────────────── */
             switch(event.key) {
 
             case InputKeyBack:
@@ -477,19 +629,19 @@ int32_t rs41_app(void* p) {
 
             case InputKeyOk:
                 if(!app->rx_active) {
-                    /* Start radio thread */
+                    app->scan_mode     = false;
                     app->radio_running = true;
                     app->rx_active     = true;
                     app->radio_thread  = furi_thread_alloc_ex(
                         "RS41Radio", 4096, radio_thread_fn, app);
                     furi_thread_start(app->radio_thread);
                 } else {
-                    /* Stop radio thread */
                     app->radio_running = false;
                     furi_thread_join(app->radio_thread);
                     furi_thread_free(app->radio_thread);
                     app->radio_thread = NULL;
                     app->rx_active    = false;
+                    app->scan_mode    = false;
                 }
                 view_port_update(app->viewport);
                 break;
@@ -507,6 +659,14 @@ int32_t rs41_app(void* p) {
                     app->freq_mhz -= FREQ_STEP_MHZ;
                     if(app->freq_mhz < FREQ_MIN_MHZ) app->freq_mhz = FREQ_MIN_MHZ;
                 }
+                view_port_update(app->viewport);
+                break;
+
+            case InputKeyRight:
+                /* Switch to frequency scanner */
+                for(int i = 0; i < SCAN_CHANNELS; i++) app->scan_rssi[i] = -120;
+                app->scan_mode = true;
+                app->view      = AppViewScanner;
                 view_port_update(app->viewport);
                 break;
 

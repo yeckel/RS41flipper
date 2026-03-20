@@ -21,6 +21,7 @@
  */
 
 #include "rs41_decoder.h"
+#include "rs41_rs.h"
 #include <string.h>
 #include <math.h>
 
@@ -314,6 +315,10 @@ bool rs41_decode(const uint8_t* fifo_bytes, int16_t rssi, Rs41Frame* out) {
     for(int i = 0; i < RS41_PAYLOAD_LEN; i++)
         frame[i] = raw[i] ^ RS41_MASK[(i + 8) & 63];
 
+    /* Step 3: Reed-Solomon error correction (in-place on frame[]) */
+    int rs_errs = rs41_rs_correct(frame, RS41_PAYLOAD_LEN);
+    (void)rs_errs; /* logged by caller if desired; negative = uncorrectable */
+
     /* Initialise output */
     memset(out, 0, sizeof(*out));
     out->temp    = -999.0f;
@@ -321,7 +326,7 @@ bool rs41_decode(const uint8_t* fifo_bytes, int16_t rssi, Rs41Frame* out) {
     out->rssi    = rssi;
     out->has_gps = false;
 
-    /* Step 3: parse blocks from byte 49 (0-47 = RS parity, 48 = frame type) */
+    /* Step 4: parse blocks from byte 49 (0-47 = RS parity, 48 = frame type) */
     bool status_found = false;
     int offset = 49, iter = 0;
     while(offset < RS41_PAYLOAD_LEN && iter < 40) {
