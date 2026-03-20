@@ -5,7 +5,6 @@ built-in CC1101 sub-GHz radio — or an **external CC1101 module** on the GPIO h
 
 Developed by OK1CHP, inspired by [twatch-rs41](https://github.com/yeckel/twatch-rs41).
 
----
 
 ## Features
 
@@ -21,7 +20,6 @@ Developed by OK1CHP, inspired by [twatch-rs41](https://github.com/yeckel/twatch-
 - Frequency tunable from 400.1 to 406.0 MHz in 0.1 MHz steps
 - **External CC1101 support** — plug in a cheap CC1101 module on the GPIO SPI header
 
----
 
 ## Controls
 
@@ -45,7 +43,6 @@ Developed by OK1CHP, inspired by [twatch-rs41](https://github.com/yeckel/twatch-
 | **OK** | Tune to cursor frequency and return to decoder |
 | **BACK** | Exit app |
 
----
 
 ## Scanner display
 
@@ -60,7 +57,6 @@ OK:decode  BACK:exit
 
 Move the cursor with UP/DOWN.  Press OK to tune the decoder to that frequency.
 
----
 
 ## Display (decoder)
 
@@ -80,7 +76,6 @@ OK:stop RT:scan UP/DN:freq
 - Signal history row: filled box **■** = decoded OK, outline □ = failed.
 - Fields show `---` while waiting for calibration frames or GPS fix.
 
----
 
 ## External CC1101 wiring
 
@@ -99,7 +94,6 @@ Connect a bare CC1101 module to the Flipper Zero GPIO header:
 Press **LEFT** on the idle decoder screen to toggle between built-in (`IN`) and
 external (`EX`) CC1101.  The setting takes effect at the next **OK** (start).
 
----
 
 ## Radio configuration (CC1101)
 
@@ -120,7 +114,6 @@ Each FIFO byte is bit-reversed, then XOR-descrambled with a 64-byte key.
 > consumes the first FIFO byte as a length field, corrupting 318-byte frames.
 > This app bypasses it with direct SPI FIFO reads.
 
----
 
 ## RS41 frame decoding
 
@@ -162,7 +155,6 @@ Rc = meas[3] / g - Rb
 P  = Cp[0] + Cp[1]·Rc + Cp[2]·Rc²     (hPa)
 ```
 
----
 
 ## Build & deploy
 
@@ -179,7 +171,6 @@ log                       # (inside ufbt cli) stream debug log
 
 Tested on firmware **1.4.3 (release)**, API 87.1, Target 7, device on `/dev/ttyACM1`.
 
----
 
 ## Finding RS41 frequencies
 
@@ -189,7 +180,6 @@ Active sondes near you:
 - <https://sondehub.org>
 - Typical Central-European range: **403–406 MHz**
 
----
 
 ## License
 
